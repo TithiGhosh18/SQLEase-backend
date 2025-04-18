@@ -7,6 +7,13 @@ import google.generativeai as genai
 import os
 from dotenv import load_dotenv
 import tempfile
+import io
+import chardet
+import csv 
+import sys
+
+# Increase max CSV field size to avoid buffer overflow
+csv.field_size_limit(2**31 - 1)
 
 # Load env variables
 load_dotenv()
@@ -17,19 +24,6 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # Setup Gemini
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel(model_name="models/gemini-1.5-flash")
-
-
-# Helper: Try multiple encodings for reading CSV
-def read_csv_safely(file):
-    encodings = ['utf-8', 'latin1', 'windows-1252', 'ISO-8859-1']
-    for enc in encodings:
-        try:
-            df = pd.read_csv(file, encoding=enc)
-            return df, enc
-        except UnicodeDecodeError:
-            continue
-    raise UnicodeDecodeError("Unable to decode CSV file with common encodings.")
-
 
 @app.route("/upload", methods=["POST"])
 def handle_csv():
@@ -50,39 +44,56 @@ def handle_csv():
     schema_strings = []
 
     try:
+        # Load each CSV as a separate table
         for file in files:
             if file.filename.endswith('.csv'):
-                table_name = os.path.splitext(file.filename)[0].replace(" ", "_")
+                raw_bytes = file.read()
+                detected = chardet.detect(raw_bytes)
+                encoding = detected['encoding'] or 'utf-8'
+                print(f"Detected encoding for {file.filename}: {encoding}")
 
+                # Decode bytes
+                decoded = raw_bytes.decode(encoding, errors='replace')
+
+                # Try detecting delimiter
                 try:
-                    df, used_encoding = read_csv_safely(file)
-                except Exception as read_error:
-                    return jsonify({"error": f"Failed to read {file.filename}: {str(read_error)}"}), 400
+                    sample = decoded[:2048]
+                    dialect = csv.Sniffer().sniff(sample)
+                    delimiter = dialect.delimiter
+                except Exception:
+                    delimiter = ','  # fallback
 
+                # Read CSV using detected encoding + delimiter
+                try:
+                    df = pd.read_csv(io.StringIO(decoded), on_bad_lines='skip', delimiter=delimiter)
+                except Exception:
+                    df = pd.read_csv(io.StringIO(decoded), on_bad_lines='skip', delimiter=delimiter, engine='python')
+
+                table_name = os.path.splitext(file.filename)[0].replace(" ", "_")
                 df.to_sql(table_name, conn, index=False, if_exists='replace')
 
-                # Generate schema
+                # Generate schema for Gemini
                 cursor.execute(f"PRAGMA table_info({table_name})")
                 columns = [col[1] for col in cursor.fetchall()]
-                schema_strings.append(f"Table: {table_name}({', '.join(columns)})")
+                schema_strings.append(f"Table: {table_name}\nColumns:\n" + "\n".join([f"- {col}" for col in columns]))
 
         full_schema = "\n".join(schema_strings)
 
         # Prompt Gemini for query
         prompt = f"""
 You are an expert ***{database_type}*** developer.
-Given the table schemas below, generate a ***{database_type}*** query to answer the question.
+Given the table schemas below, extract exact data schemas like rows and columns strictly as mentioned in csv file generate a ***{database_type}*** query based on the schema to answer the question.
 Only output the ***{database_type}*** query — no explanation or markdown.
-
+*******Do not assume or guess column/table names. Use names exactly as in schema.************
 {full_schema}
 Question: {question}
 Query:
 """
-
+        
         response = model.generate_content(prompt)
         sql_query = response.text.strip().replace("```sql", "").replace("```", "").strip()
 
-        # Prompt Gemini for SQLite version
+        # Prompt Gemini for SQLite-compatible version
         prompt2 = f"""
 You are an expert SQL developer.
 Convert the following ***{database_type}*** SQL query into a valid **SQLite-compatible SQL query** using the given schema.
@@ -95,7 +106,7 @@ Schema:
         sql_response = model.generate_content(prompt2)
         sql_final = sql_response.text.strip().replace("```sql", "").replace("```", "").strip()
 
-        # Execute query
+        # Execute the SQLite query
         cursor.execute(sql_final)
         rows = cursor.fetchall()
         headers = [desc[0] for desc in cursor.description]
@@ -107,15 +118,11 @@ Schema:
         })
 
     except Exception as e:
-        return jsonify({
-            "sql": sql_query if 'sql_query' in locals() else None,
-            "error": str(e)
-        })
+        return jsonify({"sql": sql_query if 'sql_query' in locals() else None, "error": str(e)})
 
     finally:
         conn.close()
         os.remove(db_path)
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
