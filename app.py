@@ -10,7 +10,7 @@ import tempfile
 import io
 import chardet
 import csv 
-import sys
+
 
 # Increase max CSV field size to avoid buffer overflow
 csv.field_size_limit(2**31 - 1)
